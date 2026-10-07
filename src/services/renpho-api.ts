@@ -522,7 +522,7 @@ export class RenphoApiService {
     const collected: Array<Record<string, any>> = [];
     // The classic table count is not the MorphoScan count. Scan independently;
     // do not assume a sort order or stop early based on timestamps.
-    for (let pageNum = 1; collected.length < MAX_MEASUREMENT_SCAN; pageNum++) {
+    for (let pageNum = 1; ; pageNum++) {
       const raw = await this.postEncryptedRaw(
         "RenphoHealth/scale/queryBodyCompositionMeasureData",
         session,
@@ -539,6 +539,13 @@ export class RenphoApiService {
           "Unexpected body composition measurement response (expected array)",
         );
       }
+      // Probe the page after an exact cap-sized history. Only an empty page
+      // proves that a full final page was actually the end of the history.
+      if (collected.length + page.length > MAX_MEASUREMENT_SCAN) {
+        throw new Error(
+          "Incomplete body composition history: scan limit reached before completeness could be established; latest measurement cannot be determined safely",
+        );
+      }
       collected.push(
         ...page.map((entry) => ({
           ...entry,
@@ -547,7 +554,7 @@ export class RenphoApiService {
       );
       if (page.length < 100) break;
     }
-    return collected.slice(0, MAX_MEASUREMENT_SCAN);
+    return collected;
   }
 
   private async fetchCombinedMeasurementsForTable(
@@ -561,7 +568,8 @@ export class RenphoApiService {
       this.fetchMeasurementsForTable(session, table, userIds, limit, lastAt),
       this.fetchBodyCompositionMeasurements(session, table, userIds),
     ]);
-    // Put advanced records first so duplicate IDs retain their richer fields.
+    // Source precedence and complementary metadata are merged globally after
+    // all tables have been mapped; table order must not decide the winner.
     return [
       ...bodyComposition,
       ...classic.map((entry) => ({
@@ -691,16 +699,62 @@ export class RenphoApiService {
   private dedupeAndSortMeasurements(
     measurements: RenphoMeasurement[],
   ): RenphoMeasurement[] {
-    const uniqueById = new Map<string, RenphoMeasurement>();
+    const groups = new Map<string, RenphoMeasurement[]>();
     for (const measurement of measurements) {
-      if (!uniqueById.has(measurement.id)) {
-        uniqueById.set(measurement.id, measurement);
-      }
+      // IDs alone do not establish identity across tables. Require matching
+      // timestamps and weights before considering records to be duplicates.
+      const key = JSON.stringify([
+        measurement.id,
+        measurement.time_stamp,
+        measurement.weight,
+      ]);
+      const group = groups.get(key) || [];
+      group.push(measurement);
+      groups.set(key, group);
     }
 
-    return Array.from(uniqueById.values()).sort(
-      (a, b) => b.time_stamp - a.time_stamp,
-    );
+    const merged = Array.from(groups.values()).flatMap((group) => {
+      const conflictingBindings = (["user_id", "scale_user_id"] as const).some(
+        (key) =>
+          new Set(group.map((m) => m[key]).filter((value) => value != null))
+            .size > 1,
+      );
+      // A sparse record cannot resolve contradictory bindings. Keep every
+      // record in ambiguous groups rather than assigning its data to a user.
+      if (
+        conflictingBindings ||
+        group.some(
+          (m) =>
+            !Number.isFinite(m.time_stamp) ||
+            !Number.isFinite(m.weight) ||
+            !m.id ||
+            m.id === "undefined",
+        )
+      )
+        return group;
+
+      const ordered = [...group].sort(
+        (a, b) =>
+          Number(a.measurement_source === "eightElectrodeWeight") -
+          Number(b.measurement_source === "eightElectrodeWeight"),
+      );
+      return [
+        ordered.reduce((result, m) => {
+          const present = Object.fromEntries(
+            Object.entries(m).filter(([, value]) => value != null),
+          );
+          return {
+            ...result,
+            ...present,
+            body_composition:
+              result.body_composition || m.body_composition
+                ? { ...result.body_composition, ...m.body_composition }
+                : undefined,
+          } as RenphoMeasurement;
+        }, {} as RenphoMeasurement),
+      ];
+    });
+    return merged.sort((a, b) => b.time_stamp - a.time_stamp);
   }
 
   private selectMeasurementsForCurrentUser(
